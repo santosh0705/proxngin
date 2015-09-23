@@ -1,0 +1,265 @@
+#!/usr/bin/env python
+
+"""
+
+About:
+proxngin is a tool to generate nginx dynamic configuration for 
+docker containers. It generate configuration from user supplied 
+template files and reload it. it is designed to run on foreground,
+suitable to run in a container.
+
+Usages:
+first create a separate directory for your dynamic configurations,
+ex: mkdir /etc/nginx/conf.d/dynamic.d
+than include this directory in your nginx configuration file, 
+ex: include /etc/nginx/conf.d/dynamic.d/*.conf;
+
+run proxngin with template directory and configuration directory
+parameters /path/to/proxngin -t /absolute/path/to/template/files \
+-c /absolute/path/to/separate/conf/dir
+ex: /usr/bin/proxngin -t /template -c /etc/nginx/conf.d/dynamic.d
+
+Template:
+template directory contains subdirectories per container name.
+the subdirectory name will be the same of the container name. the
+configuration file name can be any name with .conf.tmpl extension.
+each subdirectory can have set of other files too (for example 
+ssl certificate files), which will be copied to the configuration
+directory as it is. check the example template for templating 
+your own configuration.
+
+Warning:
+proxngin removes everything from configuration directory. make 
+sure your static configurations are not there in this directory.
+
+Author:
+Santosh Kumar Gupta <santosh0705 (at) gmail.com>
+
+"""
+
+import socket
+import os, os.path
+import time
+import sys
+import signal
+import json
+import urllib
+import shutil
+from   subprocess import call
+from   optparse   import OptionParser
+from   string     import Template
+
+VERSION = 1.0
+
+class HttpClient:
+  'Simple HTTP client performing GET request to Docker remote API'
+
+  def __init__(self, sock_file, timeout):
+    self.IsConnected = False
+    self.__socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    self.__socket.setblocking(1)
+    self.__socket.settimeout(timeout)
+    self.__socket.connect(sock_file)
+    self.IsConnected = True
+
+  def __readline(self):
+    if not self.IsConnected:
+      raise IOError("Socket not connected")
+    line = ""
+    c = ""
+    c_priv = ""
+    while c_priv != "\r" or c != "\n":
+      c_priv = c
+      c = self.__socket.recv(1)
+      if c == "":
+          self.IsConnected = False
+          raise IOError("Socket connection dropped")
+      line += c
+    return line.splitlines()[0]
+
+  def __getresponse(self):
+    self.__response = {}
+    line = self.__readline()
+    parts = line.split()
+    if parts[0] != "HTTP/1.1":
+      raise IOError("Invalid response")
+    self.__response["status"] = parts[1]
+    # read all the headers and add into response dictionary
+    while True:
+      line = self.__readline()
+      if line == "":
+        break
+      parts = line.split(":", 1)
+      self.__response[parts[0].strip()] = parts[1].strip()
+
+  def getcontent(self):
+    if not self.IsConnected:
+      raise IOError("Socket not connected")
+    #if its a chunked content read the size first and read the content, if its not the chunked content read the content of size from content-size
+    if "Content-Length" in self.__response:
+      size = int(self.__response["Content-Length"])
+      self.IsConnected = False
+      return self.__socket.recv(size)
+    elif "Transfer-Encoding" in self.__response:
+      if self.__response["Transfer-Encoding"] == "chunked":
+        line = self.__readline()
+        size = int(line, 16)
+        content = self.__socket.recv(size + 2)
+        return content[0:size]
+    else:
+      raise IOError("Encoding not supported")
+    return
+
+  def request(self, url):
+    if not self.IsConnected:
+      raise IOError("Socket not connected")
+    self.__socket.send("GET " + url + " HTTP/1.1\r\n\r\n")
+    self.__getresponse()
+    return self.__response
+
+  def __del__(self):
+    self.__socket.shutdown(1)
+    self.__socket.close()
+
+
+class ConfGen:
+  'Docker event listener and dynamic Nginx reverse HTTP proxy configuration generator'
+
+  def __init__(self, sock_file, conf_dir, tmpl_dir, timeout):
+    self.__sock_file = sock_file
+    self.__conf_dir = conf_dir
+    self.__tmpl_dir = tmpl_dir
+    self.__timeout = timeout
+
+  def updateconfig(self):
+    client = HttpClient(self.__sock_file, self.__timeout)
+    # get the names of containers to be configured
+    cnames = [ "/" + f for f in os.listdir(self.__tmpl_dir) if os.path.isdir(os.path.join(self.__tmpl_dir, f)) ]
+    # delete everything in configuration directory
+    for f in os.listdir(self.__conf_dir):
+      filepath = os.path.join(self.__conf_dir, f)
+      if os.path.isdir(filepath):
+        shutil.rmtree(filepath)
+      else:
+        os.remove(filepath)
+    # query the running containers and prepare the configuration
+    query = urllib.urlencode({'filters':'{"status":["running"]}'})
+    response = client.request("/containers/json?" + query)
+    if response["status"] != "200":
+      del client
+      raise IOError("HTTP error:" + response["status"])
+    containers = json.loads(client.getcontent())
+    del client
+    for container in containers:
+      if len(set(container["Names"]).intersection(cnames)) != 0:
+        # get the container parameters and write the configuration file here
+        client = HttpClient(self.__sock_file, self.__timeout)
+        response = client.request("/containers/" + container["Id"] + "/json")
+        if response["status"] != "200":
+          del client
+          continue
+        data = json.loads(client.getcontent())
+        del client
+        tmpl_dict = dict( Name = data["Name"],
+          IPAddress = data["NetworkSettings"]["IPAddress"],
+          Hostname = data["Config"]["Hostname"],
+          Domainname = data["Config"]["Domainname"] )
+        path = self.__tmpl_dir + data["Name"]
+        for f in os.listdir(path):
+          filepath = os.path.join(path, f)
+          if f.endswith(".tmpl") and os.path.isfile(filepath):
+            # file is a template file, get the content, render it and write in configuration directory
+            with open(filepath, "r") as tmpl_file:
+              tmpl = tmpl_file.read()
+              config = Template(tmpl).safe_substitute(tmpl_dict)
+              with open(os.path.join(self.__conf_dir, os.path.splitext(f)[0]), "w") as config_file:
+                config_file.write(config)
+          else:
+            # file is a file or directory copy it directly in configuration directory
+            if os.path.isdir(filepath):
+              shutil.copytree(filepath, os.path.join(self.__conf_dir, f))
+            else:
+              shutil.copy(filepath, self.__conf_dir)
+    call(["/usr/sbin/nginx", "-s", "reload"])
+
+  def eventlistener(self):
+    client = HttpClient(self.__sock_file, self.__timeout)
+    query = urllib.urlencode({'filters':'{"event":["start","die","stop"]}'})
+    response = client.request("/events?" + query)
+    if response["status"] != "200":
+      del client
+      raise IOError("HTTP error:" + response["status"])
+    while True:
+      event = json.loads(client.getcontent())
+      self.updateconfig()
+
+
+
+def sigterm_handler(_signo, _stack_frame):
+  # Raises SystemExit(0):
+  print "Caught TERM signal"
+  sys.exit(0)
+
+
+
+def main(conf_dir, tmpl_dir):
+  signal.signal(signal.SIGTERM, sigterm_handler)
+
+  sock_file = "/var/run/docker.sock"
+  timeout = None
+
+  time.sleep(3)
+  #create the config for running containers
+  confgen = ConfGen(sock_file, conf_dir, tmpl_dir, timeout)
+  try:
+    confgen.updateconfig()
+  except KeyboardInterrupt:
+    raise
+  except SystemExit:
+    print "Exiting application"
+    raise
+  except BaseException, e:
+    print "Exception occured: " + str(e)
+  finally:
+    del confgen
+  while True:
+    if os.path.exists(sock_file):
+      confgen = ConfGen(sock_file, conf_dir, tmpl_dir, timeout)
+      try:
+        confgen.eventlistener()
+      except KeyboardInterrupt:
+        raise
+      except SystemExit:
+        print "Exiting application"
+        raise
+      except BaseException, e:
+        print "Exception occured " + str(e)
+        time.sleep(1)
+      finally:
+        del confgen
+    else:
+      time.sleep(5)
+
+
+# ==========================================================
+
+if __name__ == "__main__":
+  usage = "usage: %prog [options]"
+  description = 'Create dymamic reverse proxy configuration for Nginx.'
+  parser = OptionParser(description=description, usage=usage, version="%%prog %s" % VERSION)
+  parser.add_option("-t", "--templatedir", metavar="PATH", dest="templatedir", help="absolute path of template directory")
+  parser.add_option("-c", "--configdir", metavar="PATH", dest="configdir", help="absolute path of configuration directory")
+  (options, args) = parser.parse_args()
+
+  if (options.templatedir is None) or (options.configdir is None):
+    print "key options not passed...\n"
+    parser.print_help()
+    sys.exit(-1)
+  elif not (os.path.isabs(options.templatedir) and (os.path.isdir(options.templatedir))):
+    parser.error('template director does not exist or not an absoute path')
+  elif not (os.path.isabs(options.configdir) and (os.path.isdir(options.configdir))):
+    parser.error('configuration directory does not exist or not an absoute path')
+
+  main(os.path.normpath(options.configdir), os.path.normpath(options.templatedir))
+
+# ==========================================================
